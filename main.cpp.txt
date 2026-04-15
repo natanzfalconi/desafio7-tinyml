@@ -1,0 +1,184 @@
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "pico/stdlib.h"
+#include "hardware/i2c.h"
+#include "hardware/gpio.h"
+
+// Biblioteca do Cérebro da Inteligência Artificial
+#include "edge-impulse-sdk/classifier/ei_run_classifier.h"
+
+// --- CONFIGS TELA E SENSOR (Desafio 4) ---
+#define I2C0_PORT i2c0
+#define MPU_SDA_PIN 4
+#define MPU_SCL_PIN 5
+#define MPU_ADDR 0x68
+
+#define I2C1_PORT i2c1
+#define OLED_SDA_PIN 14
+#define OLED_SCL_PIN 15
+#define OLED_ADDR 0x3C
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+
+static uint8_t oled_buffer[OLED_WIDTH * OLED_HEIGHT / 8];
+
+// Funções da Tela (Omiti o meio para focar na lógica, mas elas funcionam igual)
+void oled_cmd(uint8_t cmd) {
+    uint8_t buf[2] = {0x00, cmd};
+    i2c_write_blocking(I2C1_PORT, OLED_ADDR, buf, 2, false);
+}
+void oled_init() {
+    sleep_ms(100);
+    uint8_t init_cmds[] = {0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40, 0x8D, 0x14, 0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x12, 0x81, 0x7F, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6, 0xAF};
+    for(int i=0; i<sizeof(init_cmds); i++) oled_cmd(init_cmds[i]);
+    memset(oled_buffer, 0, sizeof(oled_buffer));
+}
+void oled_update() {
+    for (uint8_t page = 0; page < 8; page++) {
+        oled_cmd(0xB0 + page); oled_cmd(0x00); oled_cmd(0x10);
+        uint8_t data[OLED_WIDTH + 1]; data[0] = 0x40;
+        memcpy(&data[1], &oled_buffer[page * OLED_WIDTH], OLED_WIDTH);
+        i2c_write_blocking(I2C1_PORT, OLED_ADDR, data, OLED_WIDTH + 1, false);
+    }
+}
+void oled_draw_pixel(int x, int y, bool on) {
+    if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) return;
+    int byte_index = x + (y / 8) * OLED_WIDTH; int bit_index = y % 8;
+    if (on) oled_buffer[byte_index] |= (1 << bit_index); else oled_buffer[byte_index] &= ~(1 << bit_index);
+}
+void oled_draw_char(int x, int y, char c) {
+    static const uint8_t font_5x7[] = {
+        0x3E, 0x51, 0x49, 0x45, 0x3E, 0x00, 0x42, 0x7F, 0x40, 0x00, 0x42, 0x61, 0x51, 0x49, 0x46, 0x21, 0x41, 0x49, 0x4D, 0x33,
+        0x18, 0x14, 0x12, 0x7F, 0x10, 0x27, 0x45, 0x45, 0x45, 0x39, 0x3C, 0x4A, 0x49, 0x49, 0x31, 0x41, 0x21, 0x11, 0x09, 0x07,
+        0x36, 0x49, 0x49, 0x49, 0x36, 0x46, 0x49, 0x49, 0x29, 0x1E, 0x7E, 0x09, 0x09, 0x09, 0x7E, 0x7F, 0x49, 0x49, 0x49, 0x36,
+        0x3E, 0x41, 0x41, 0x41, 0x22, 0x7F, 0x41, 0x41, 0x41, 0x3E, 0x7F, 0x49, 0x49, 0x49, 0x41, 0x7F, 0x09, 0x09, 0x09, 0x01,
+        0x3E, 0x41, 0x49, 0x49, 0x7A, 0x7F, 0x08, 0x08, 0x08, 0x7F, 0x00, 0x41, 0x7F, 0x41, 0x00, 0x20, 0x40, 0x41, 0x3F, 0x01,
+        0x7F, 0x08, 0x14, 0x22, 0x41, 0x7F, 0x40, 0x40, 0x40, 0x40, 0x7F, 0x02, 0x0C, 0x02, 0x7F, 0x7F, 0x04, 0x08, 0x10, 0x7F,
+        0x3E, 0x41, 0x41, 0x41, 0x3E, 0x7F, 0x09, 0x09, 0x09, 0x06, 0x3E, 0x41, 0x51, 0x21, 0x5E, 0x7F, 0x09, 0x09, 0x19, 0x66,
+        0x46, 0x49, 0x49, 0x49, 0x31, 0x01, 0x01, 0x7F, 0x01, 0x01, 0x3F, 0x40, 0x40, 0x40, 0x3F, 0x1F, 0x20, 0x40, 0x20, 0x1F,
+        0x3F, 0x40, 0x38, 0x40, 0x3F, 0x63, 0x14, 0x08, 0x14, 0x63, 0x07, 0x08, 0x70, 0x08, 0x07, 0x61, 0x51, 0x49, 0x45, 0x43,
+        0x00, 0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A, 0x1C, 0x7F, 0x1C, 0x2A, 
+    };
+    int index = -1;
+    if (c >= '0' && c <= '9') index = c - '0';
+    else if (c >= 'A' && c <= 'Z') index = 10 + (c - 'A');
+    else if (c >= 'a' && c <= 'z') index = 10 + (c - 'a');
+    else if (c == ':') index = 36;
+    else if (c == ' ') index = 37;
+    else if (c == '*') index = 38;
+    else if (c == '%') index = 38; 
+    
+    if (index >= 0 && index <= 38) {
+        const uint8_t *char_data = &font_5x7[index * 5];
+        for (int col = 0; col < 5; col++) {
+            uint8_t col_data = char_data[col];
+            for (int row = 0; row < 7; row++) {
+                bool pixel = (col_data >> row) & 1;
+                oled_draw_pixel(x + col, y + row, pixel);
+            }
+        }
+    }
+}
+void oled_draw_string(int x, int y, const char *str) {
+    int start_x = x;
+    while (*str) {
+        oled_draw_char(start_x, y, *str); start_x += 6; str++;
+        if (start_x > OLED_WIDTH - 6) { start_x = x; y += 8; }
+    }
+}
+void oled_clear() { memset(oled_buffer, 0, sizeof(oled_buffer)); }
+
+// Inicialização e Leitura MPU6500
+static void mpu_init() {
+    uint8_t buf[] = {0x6B, 0x80};
+    i2c_write_blocking(I2C0_PORT, MPU_ADDR, buf, 2, false); sleep_ms(100);
+    buf[1] = 0x00; i2c_write_blocking(I2C0_PORT, MPU_ADDR, buf, 2, false); sleep_ms(10);
+}
+static void mpu6500_read_raw(int16_t accel[3], int16_t *temp) {
+    uint8_t buffer[6]; uint8_t val = 0x3B;
+    i2c_write_blocking(I2C0_PORT, MPU_ADDR, &val, 1, true);
+    i2c_read_blocking(I2C0_PORT, MPU_ADDR, buffer, 6, false);
+    for (int i = 0; i < 3; i++) accel[i] = (buffer[i * 2] << 8 | buffer[(i * 2) + 1]);
+}
+
+// ================== A INTELIGÊNCIA ARTIFICIAL EM AÇÃO ==================
+int main() {
+    stdio_init_all();
+    sleep_ms(500);
+
+    // Liga o I2C0 (Sensor) e I2C1 (Tela)
+    i2c_init(I2C0_PORT, 100000); 
+    gpio_set_function(MPU_SDA_PIN, GPIO_FUNC_I2C); gpio_set_function(MPU_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(MPU_SDA_PIN); gpio_pull_up(MPU_SCL_PIN);
+    
+    i2c_init(I2C1_PORT, 400000);
+    gpio_set_function(OLED_SDA_PIN, GPIO_FUNC_I2C); gpio_set_function(OLED_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(OLED_SDA_PIN); gpio_pull_up(OLED_SCL_PIN);
+
+    mpu_init();
+    oled_init();
+
+    oled_clear();
+    oled_draw_string(10, 20, "Iniciando IA...");
+    oled_update();
+    sleep_ms(2000);
+
+    // Array que vai guardar as leituras do movimento para a IA processar
+    float buffer_ia[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+
+    while (1) {
+        oled_clear();
+        oled_draw_string(10, 20, "Lendo movimento");
+        oled_update();
+
+        // 1. CAPTURA DOS DADOS: Enchemos a memória da IA com os movimentos do sensor
+        for (size_t i = 0; i < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE; i += 3) {
+            int16_t raw_accel[3], raw_temp;
+            mpu6500_read_raw(raw_accel, &raw_temp);
+
+            // A IA treinou com valores em Metros por Segundo Quadrado (m/s^2). 1g = 9.81m/s^2
+            buffer_ia[i + 0] = (raw_accel[0] / 16384.0f) * 9.81f; 
+            buffer_ia[i + 1] = (raw_accel[1] / 16384.0f) * 9.81f;
+            buffer_ia[i + 2] = (raw_accel[2] / 16384.0f) * 9.81f;
+
+            // Espera o tempo exato que o Edge Impulse exige entre as leituras
+            sleep_ms((int)EI_CLASSIFIER_INTERVAL_MS);
+        }
+
+        oled_clear(); oled_draw_string(10, 20, "Classificando.."); oled_update();
+
+        // 2. A PREVISÃO: Transformamos os dados brutos e jogamos para a Rede Neural julgar
+        signal_t signal;
+        numpy::signal_from_buffer(buffer_ia, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
+        
+        ei_impulse_result_t result = { 0 };
+        run_classifier(&signal, &result, false);
+
+        // 3. O RESULTADO: Vasculhamos qual foi o movimento com a maior probabilidade (Confiança)
+        float maior_confianca = 0.0f;
+        int melhor_movimento = 0;
+        
+        for (size_t idx = 0; idx < EI_CLASSIFIER_LABEL_COUNT; idx++) {
+            if (result.classification[idx].value > maior_confianca) {
+                maior_confianca = result.classification[idx].value;
+                melhor_movimento = idx;
+            }
+        }
+
+        // 4. EXIBIR NA TELA: Mostramos o que a IA adivinhou
+        oled_clear();
+        oled_draw_string(0, 0, "MODELO TINYML");
+        oled_draw_string(0, 20, "CLASSE:");
+        oled_draw_string(45, 20, result.classification[melhor_movimento].label); // Ex: "OK" ou "FALHA"
+        
+        char buf[32];
+        snprintf(buf, sizeof(buf), "CONFIANCA: %.0f*", maior_confianca * 100);
+        oled_draw_string(0, 40, buf);
+        oled_update();
+
+        // Pausa 3 segundos para você ler antes de medir de novo
+        sleep_ms(3000);
+    }
+    return 0;
+}
